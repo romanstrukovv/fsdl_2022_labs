@@ -1,5 +1,7 @@
 """Experiment-running framework."""
+
 import argparse
+import inspect
 from pathlib import Path
 
 import numpy as np
@@ -10,20 +12,49 @@ import torch
 from text_recognizer import lit_models
 from training.util import DATA_CLASS_MODULE, import_class, MODEL_CLASS_MODULE, setup_data_and_model_from_args
 
-
 # In order to ensure reproducible experiments, we must set random seeds.
 np.random.seed(42)
 torch.manual_seed(42)
+
+
+def _str_to_bool(v):
+    """Helper to perfectly mimic PyTorch Lightning 1.x argparse boolean flags."""
+    if isinstance(v, bool):
+        return v
+    if v.lower() in ("yes", "true", "t", "y", "1"):
+        return True
+    if v.lower() in ("no", "false", "f", "n", "0"):
+        return False
+    raise argparse.ArgumentTypeError("Boolean value expected.")
 
 
 def _setup_parser():
     """Set up Python's ArgumentParser with data, model, trainer, and other arguments."""
     parser = argparse.ArgumentParser(add_help=False)
 
-    # Add Trainer specific arguments, such as --max_epochs, --gpus, --precision
-    trainer_parser = pl.Trainer.add_argparse_args(parser)
-    trainer_parser._action_groups[1].title = "Trainer Args"
-    parser = argparse.ArgumentParser(add_help=False, parents=[trainer_parser])
+    # Replace deprecated pl.Trainer.add_argparse_args dynamically for PL 2.0+
+    trainer_group = parser.add_argument_group("Trainer Args")
+    sig = inspect.signature(pl.Trainer.__init__)
+    for name, param in sig.parameters.items():
+        if name in ["self", "logger", "callbacks", "profiler"]:
+            continue
+
+        default_val = param.default
+        if default_val is not inspect.Parameter.empty and type(default_val) in (int, float, str, bool):
+            if type(default_val) is bool:
+                # Allows both `--fast_dev_run` and `--fast_dev_run False`
+                trainer_group.add_argument(
+                    f"--{name}", type=_str_to_bool, default=default_val, const=not default_val, nargs="?"
+                )
+            else:
+                trainer_group.add_argument(f"--{name}", type=type(default_val), default=default_val)
+        else:
+            trainer_group.add_argument(f"--{name}", default=default_val)
+
+    # Legacy FSDL flags missing in PL 2.0+
+    trainer_group.add_argument("--gpus", type=str, default=None, help="Legacy FSDL argument")
+    trainer_group.add_argument("--auto_lr_find", action="store_true", default=False)
+
     parser.set_defaults(max_epochs=1)
 
     # Basic arguments
@@ -76,26 +107,6 @@ def _ensure_logging_dir(experiment_dir):
 
 
 def main():
-    """
-    Run an experiment.
-
-    Sample command:
-    ```
-    python training/run_experiment.py --max_epochs=3 --gpus='0,' --num_workers=20 --model_class=MLP --data_class=MNIST
-    ```
-
-    For basic help documentation, run the command
-    ```
-    python training/run_experiment.py --help
-    ```
-
-    The available command line args differ depending on some of the arguments, including --model_class and --data_class.
-
-    To see which command line args are available and read their documentation, provide values for those arguments
-    before invoking --help, like so:
-    ```
-    python training/run_experiment.py --model_class=MLP --data_class=MNIST --help
-    """
     parser = _setup_parser()
     args = parser.parse_args()
     data, model = setup_data_and_model_from_args(args)
@@ -133,9 +144,28 @@ def main():
         )
         callbacks.append(early_stopping_callback)
 
-    trainer = pl.Trainer.from_argparse_args(args, callbacks=callbacks, logger=logger)
+    # --- PL 2.0 Fix: Pluck valid Trainer arguments manually ---
+    valid_kwargs = inspect.signature(pl.Trainer.__init__).parameters.keys()
+    trainer_kwargs = {k: v for k, v in vars(args).items() if k in valid_kwargs}
 
-    trainer.tune(lit_model, datamodule=data)  # If passing --auto_lr_find, this will set learning rate
+    # Handle legacy FSDL --gpus string converting to accelerator + devices
+    if hasattr(args, "gpus") and args.gpus is not None:
+        trainer_kwargs["accelerator"] = "gpu"
+        if isinstance(args.gpus, str) and "," in args.gpus:
+            trainer_kwargs["devices"] = [int(x) for x in args.gpus.split(",") if x.strip()]
+        else:
+            trainer_kwargs["devices"] = int(args.gpus)
+
+    trainer = pl.Trainer(**trainer_kwargs, callbacks=callbacks, logger=logger)
+
+    # --- PL 2.0 Fix: tune() migrated to Tuner object ---
+    if hasattr(args, "auto_lr_find") and args.auto_lr_find:
+        try:
+            from pytorch_lightning.tuner import Tuner
+
+            Tuner(trainer).lr_find(lit_model, datamodule=data)
+        except ImportError:
+            trainer.tune(lit_model, datamodule=data)  # Fallback
 
     trainer.fit(lit_model, datamodule=data)
 
