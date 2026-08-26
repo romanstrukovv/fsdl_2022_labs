@@ -156,6 +156,9 @@ def main():
         else:
             trainer_kwargs["devices"] = int(args.gpus)
 
+    if trainer_kwargs.get("max_epochs") is not None:
+        trainer_kwargs["max_epochs"] = int(trainer_kwargs["max_epochs"])
+
     trainer = pl.Trainer(**trainer_kwargs, callbacks=callbacks, logger=logger)
 
     # --- PL 2.0 Fix: tune() migrated to Tuner object ---
