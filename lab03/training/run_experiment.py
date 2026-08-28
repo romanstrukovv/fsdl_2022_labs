@@ -1,4 +1,5 @@
 """Experiment-running framework."""
+
 import argparse
 from pathlib import Path
 
@@ -10,21 +11,42 @@ import torch
 from text_recognizer import lit_models
 from training.util import DATA_CLASS_MODULE, import_class, MODEL_CLASS_MODULE, setup_data_and_model_from_args
 
-
 # In order to ensure reproducible experiments, we must set random seeds.
 np.random.seed(42)
 torch.manual_seed(42)
+
+
+def _parse_fraction_or_int(val):
+    """Safely parse float vs int. PyTorch Lightning treats 1.0 (float) as 100% and 1 (int) as 1 batch."""
+    if isinstance(val, str):
+        if "." in val:
+            return float(val)
+        return int(val)
+    return val
 
 
 def _setup_parser():
     """Set up Python's ArgumentParser with data, model, trainer, and other arguments."""
     parser = argparse.ArgumentParser(add_help=False)
 
-    # Add Trainer specific arguments, such as --max_epochs, --gpus, --precision
-    trainer_parser = pl.Trainer.add_argparse_args(parser)
-    trainer_parser._action_groups[1].title = "Trainer Args"
-    parser = argparse.ArgumentParser(add_help=False, parents=[trainer_parser])
-    parser.set_defaults(max_epochs=1)
+    # Replaces pl.Trainer.add_argparse_args to support PyTorch Lightning 2.0+
+    trainer_group = parser.add_argument_group("Trainer Args")
+    trainer_group.add_argument("--max_epochs", type=int, default=1)
+    trainer_group.add_argument("--accelerator", type=str, default="auto")
+    trainer_group.add_argument("--devices", type=str, default="auto")
+    trainer_group.add_argument("--gpus", type=str, default=None, help="Legacy arg: mapped to accelerator='gpu'")
+    trainer_group.add_argument("--precision", type=str, default="32")
+    trainer_group.add_argument("--fast_dev_run", action="store_true", default=False)
+    trainer_group.add_argument("--overfit_batches", type=_parse_fraction_or_int, default=0.0)
+    trainer_group.add_argument("--check_val_every_n_epoch", type=int, default=1)
+    trainer_group.add_argument("--limit_train_batches", type=_parse_fraction_or_int, default=1.0)
+    trainer_group.add_argument("--limit_val_batches", type=_parse_fraction_or_int, default=1.0)
+    trainer_group.add_argument("--limit_test_batches", type=_parse_fraction_or_int, default=1.0)
+    trainer_group.add_argument("--accumulate_grad_batches", type=int, default=1)
+    trainer_group.add_argument("--gradient_clip_val", type=float, default=None)
+    trainer_group.add_argument("--log_every_n_steps", type=int, default=50)
+    trainer_group.add_argument("--auto_lr_find", action="store_true", default=False)
+    trainer_group.add_argument("--strategy", type=str, default="auto")
 
     # Basic arguments
     parser.add_argument(
@@ -76,26 +98,6 @@ def _ensure_logging_dir(experiment_dir):
 
 
 def main():
-    """
-    Run an experiment.
-
-    Sample command:
-    ```
-    python training/run_experiment.py --max_epochs=3 --gpus='0,' --num_workers=20 --model_class=MLP --data_class=MNIST
-    ```
-
-    For basic help documentation, run the command
-    ```
-    python training/run_experiment.py --help
-    ```
-
-    The available command line args differ depending on some of the arguments, including --model_class and --data_class.
-
-    To see which command line args are available and read their documentation, provide values for those arguments
-    before invoking --help, like so:
-    ```
-    python training/run_experiment.py --model_class=MLP --data_class=MNIST --help
-    """
     parser = _setup_parser()
     args = parser.parse_args()
     data, model = setup_data_and_model_from_args(args)
@@ -119,6 +121,7 @@ def main():
     filename_format = "epoch={epoch:04d}-validation.loss={validation/loss:.3f}"
     if goldstar_metric == "validation/cer":
         filename_format += "-validation.cer={validation/cer:.3f}"
+
     checkpoint_callback = pl.callbacks.ModelCheckpoint(
         save_top_k=5,
         filename=filename_format,
@@ -138,16 +141,64 @@ def main():
         )
         callbacks.append(early_stopping_callback)
 
-    trainer = pl.Trainer.from_argparse_args(args, callbacks=callbacks, logger=logger)
+    # Map the parsed args to trainer kwargs manually
+    trainer_kwargs = {
+        "max_epochs": args.max_epochs,
+        "accelerator": args.accelerator,
+        "precision": args.precision,
+        "fast_dev_run": args.fast_dev_run,
+        "overfit_batches": args.overfit_batches,
+        "check_val_every_n_epoch": args.check_val_every_n_epoch,
+        "limit_train_batches": args.limit_train_batches,
+        "limit_val_batches": args.limit_val_batches,
+        "limit_test_batches": args.limit_test_batches,
+        "accumulate_grad_batches": args.accumulate_grad_batches,
+        "log_every_n_steps": args.log_every_n_steps,
+        "strategy": args.strategy,
+        "callbacks": callbacks,
+        "logger": logger,
+    }
 
-    trainer.tune(lit_model, datamodule=data)  # If passing --auto_lr_find, this will set learning rate
+    if args.gradient_clip_val is not None:
+        trainer_kwargs["gradient_clip_val"] = args.gradient_clip_val
+
+    # Backward compatibility with PyTorch Lightning 1.x --gpus format (e.g., '0,')
+    if args.gpus is not None:
+        trainer_kwargs["accelerator"] = "gpu"
+        if isinstance(args.gpus, str) and args.gpus.endswith(","):
+            trainer_kwargs["devices"] = [int(x) for x in args.gpus.split(",") if x]
+        else:
+            try:
+                trainer_kwargs["devices"] = int(args.gpus)
+            except ValueError:
+                trainer_kwargs["devices"] = args.gpus
+    else:
+        try:
+            trainer_kwargs["devices"] = int(args.devices)
+        except ValueError:
+            trainer_kwargs["devices"] = args.devices
+
+    # Instantiate Trainer with mapped kwargs (replacing from_argparse_args)
+    trainer = pl.Trainer(**trainer_kwargs)
+
+    # Handle LR finder changes in PL 2.0+
+    if args.auto_lr_find:
+        try:
+            from pytorch_lightning.tuner import Tuner
+
+            tuner = Tuner(trainer)
+            tuner.lr_find(lit_model, datamodule=data)
+        except ImportError:
+            # Fallback in case a legacy version somehow hits this block
+            trainer.tune(lit_model, datamodule=data)
 
     trainer.fit(lit_model, datamodule=data)
 
     best_model_path = checkpoint_callback.best_model_path
     if best_model_path:
         rank_zero_info(f"Best model saved at: {best_model_path}")
-        trainer.test(datamodule=data, ckpt_path=best_model_path)
+        # Explicitly pass model to test() which is safer in PL 2.0+
+        trainer.test(lit_model, datamodule=data, ckpt_path=best_model_path)
     else:
         trainer.test(lit_model, datamodule=data)
 
