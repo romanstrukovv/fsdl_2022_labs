@@ -40,7 +40,7 @@ class BaseLitModel(pl.LightningModule):
         self.one_cycle_max_lr = self.args.get("one_cycle_max_lr", None)
         self.one_cycle_total_steps = self.args.get("one_cycle_total_steps", ONE_CYCLE_TOTAL_STEPS)
 
-        num_classes = len(self.mapping)
+        num_classes = len(self.args.get("mapping", [])) if "mapping" in self.args and self.args["mapping"] else 100
         self.train_acc = Accuracy(task="multiclass", num_classes=num_classes)
         self.val_acc = Accuracy(task="multiclass", num_classes=num_classes)
         self.test_acc = Accuracy(task="multiclass", num_classes=num_classes)
