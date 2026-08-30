@@ -1,5 +1,7 @@
 """Experiment-running framework."""
+
 import argparse
+import inspect
 from pathlib import Path
 
 import numpy as np
@@ -8,10 +10,8 @@ from pytorch_lightning.utilities.rank_zero import rank_zero_info, rank_zero_only
 import torch
 
 from text_recognizer import callbacks as cb
-
 from text_recognizer import lit_models
 from training.util import DATA_CLASS_MODULE, import_class, MODEL_CLASS_MODULE, setup_data_and_model_from_args
-
 
 # In order to ensure reproducible experiments, we must set random seeds.
 np.random.seed(42)
@@ -22,11 +22,19 @@ def _setup_parser():
     """Set up Python's ArgumentParser with data, model, trainer, and other arguments."""
     parser = argparse.ArgumentParser(add_help=False)
 
-    # Add Trainer specific arguments, such as --max_epochs, --gpus, --precision
-    trainer_parser = pl.Trainer.add_argparse_args(parser)
-    trainer_parser._action_groups[1].title = "Trainer Args"
-    parser = argparse.ArgumentParser(add_help=False, parents=[trainer_parser])
-    parser.set_defaults(max_epochs=1)
+    # Manually add common Trainer arguments for PyTorch Lightning 2.0+
+    trainer_group = parser.add_argument_group("Trainer Args")
+    trainer_group.add_argument("--max_epochs", type=int, default=1)
+    trainer_group.add_argument("--accelerator", type=str, default="auto", help="e.g., 'auto', 'gpu', 'cpu', 'mps'")
+    trainer_group.add_argument("--devices", type=str, default="auto", help="e.g., 'auto', '1', '0,'")
+    trainer_group.add_argument("--precision", type=str, default="32", help="e.g., '32', '16-mixed', 'bf16-mixed'")
+    trainer_group.add_argument("--check_val_every_n_epoch", type=int, default=1)
+    trainer_group.add_argument("--log_every_n_steps", type=int, default=50)
+    trainer_group.add_argument("--fast_dev_run", type=bool, default=False)
+    trainer_group.add_argument("--auto_lr_find", action="store_true", default=False)
+    trainer_group.add_argument("--limit_train_batches", type=float, default=1.0)
+    trainer_group.add_argument("--limit_val_batches", type=float, default=1.0)
+    trainer_group.add_argument("--limit_test_batches", type=float, default=1.0)
 
     # Basic arguments
     parser.add_argument(
@@ -89,20 +97,13 @@ def main():
 
     Sample command:
     ```
-    python training/run_experiment.py --max_epochs=3 --gpus='0,' --num_workers=20 --model_class=MLP --data_class=MNIST
+    python training/run_experiment.py --max_epochs=3 --accelerator=gpu --devices=1 --num_workers=20 --model_class=MLP --data_class=MNIST
     ```
 
     For basic help documentation, run the command
     ```
     python training/run_experiment.py --help
     ```
-
-    The available command line args differ depending on some of the arguments, including --model_class and --data_class.
-
-    To see which command line args are available and read their documentation, provide values for those arguments
-    before invoking --help, like so:
-    ```
-    python training/run_experiment.py --model_class=MLP --data_class=MNIST --help
     """
     parser = _setup_parser()
     args = parser.parse_args()
@@ -127,6 +128,7 @@ def main():
     filename_format = "epoch={epoch:04d}-validation.loss={validation/loss:.3f}"
     if goldstar_metric == "validation/cer":
         filename_format += "-validation.cer={validation/cer:.3f}"
+
     checkpoint_callback = pl.callbacks.ModelCheckpoint(
         save_top_k=5,
         filename=filename_format,
@@ -155,9 +157,18 @@ def main():
     if args.wandb and args.loss in ("transformer",):
         callbacks.append(cb.ImageToTextLogger())
 
-    trainer = pl.Trainer.from_argparse_args(args, callbacks=callbacks, logger=logger)
+    # Filter the parsed arguments to include only those valid for pl.Trainer
+    trainer_init_args = inspect.signature(pl.Trainer).parameters
+    trainer_kwargs = {k: v for k, v in vars(args).items() if k in trainer_init_args}
 
-    trainer.tune(lit_model, datamodule=data)  # If passing --auto_lr_find, this will set learning rate
+    trainer = pl.Trainer(**trainer_kwargs, callbacks=callbacks, logger=logger)
+
+    # In PyTorch Lightning 2.0+, learning rate tuning is done via the Tuner class
+    if args.auto_lr_find:
+        from pytorch_lightning.tuner import Tuner
+
+        tuner = Tuner(trainer)
+        tuner.lr_find(lit_model, datamodule=data)
 
     trainer.fit(lit_model, datamodule=data)
 
