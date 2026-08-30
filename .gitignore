@@ -62,3 +62,4 @@ requirements/dev-lint.txt
 bootstrap.py
 **/fixme.py
 .server.env
+lab01/data/

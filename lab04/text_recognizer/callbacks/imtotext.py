@@ -21,7 +21,7 @@ class ImageToTextTableLogger(pl.Callback):
         self._required_keys = ["gt_strs", "pred_strs"]
 
     @rank_zero_only
-    def on_train_batch_end(self, trainer, module, output, batch, batch_idx):
+    def on_train_batch_end(self, trainer, module, output, batch, batch_idx, **kwargs):
         if self.on_train:
             if self.has_metrics(output):
                 if check_and_warn(trainer.logger, "log_table", "image-to-text table"):
@@ -30,7 +30,7 @@ class ImageToTextTableLogger(pl.Callback):
                     self._log_image_text_table(trainer, output, batch, "train/predictions")
 
     @rank_zero_only
-    def on_validation_batch_end(self, trainer, module, output, batch, batch_idx, dataloader_idx):
+    def on_validation_batch_end(self, trainer, module, output, batch, batch_idx, dataloader_idx=0, **kwargs):
         if self.has_metrics(output):
             if check_and_warn(trainer.logger, "log_table", "image-to-text table"):
                 return
@@ -66,7 +66,7 @@ class ImageToTextCaptionLogger(pl.Callback):
         self._required_keys = ["gt_strs", "pred_strs"]
 
     @rank_zero_only
-    def on_train_batch_end(self, trainer, module, output, batch, batch_idx):
+    def on_train_batch_end(self, trainer, module, output, batch, batch_idx, **kwargs):
         if self.has_metrics(output):
             if check_and_warn(trainer.logger, "log_image", "image-to-text"):
                 return
@@ -74,7 +74,7 @@ class ImageToTextCaptionLogger(pl.Callback):
                 self._log_image_text_caption(trainer, output, batch, "train/predictions")
 
     @rank_zero_only
-    def on_validation_batch_end(self, trainer, module, output, batch, batch_idx, dataloader_idx):
+    def on_validation_batch_end(self, trainer, module, output, batch, batch_idx, dataloader_idx=0, **kwargs):
         if self.has_metrics(output):
             if check_and_warn(trainer.logger, "log_image", "image-to-text"):
                 return
@@ -82,7 +82,7 @@ class ImageToTextCaptionLogger(pl.Callback):
                 self._log_image_text_caption(trainer, output, batch, "validation/predictions")
 
     @rank_zero_only
-    def on_test_batch_end(self, trainer, module, output, batch, batch_idx, dataloader_idx):
+    def on_test_batch_end(self, trainer, module, output, batch, batch_idx, dataloader_idx=0, **kwargs):
         if self.has_metrics(output):
             if check_and_warn(trainer.logger, "log_image", "image-to-text"):
                 return
@@ -92,6 +92,7 @@ class ImageToTextCaptionLogger(pl.Callback):
     def _log_image_text_caption(self, trainer, output, batch, key):
         xs, _ = batch
         gt_strs = output["gt_strs"]
+
         pred_strs = output["pred_strs"]
 
         mx = self.max_images_to_log
