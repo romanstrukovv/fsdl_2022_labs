@@ -6,11 +6,13 @@ and uploaded to W&B.
 If based on a model that is already converted and uploaded, the model file is downloaded locally.
 
 For details on how the W&B artifacts backing the checkpoints and models are handled,
-see the documenation for stage_model.find_artifact.
+see the documentation for stage_model.find_artifact.
 """
+
 import argparse
 from pathlib import Path
 import tempfile
+import urllib.request
 
 import torch
 import wandb
@@ -18,93 +20,127 @@ import wandb
 from text_recognizer.lit_models import TransformerLitModel
 from training.util import setup_data_and_model_from_args
 
-
-# these names are all set by the pl.loggers.WandbLogger
+# These names are all set by the pl.loggers.WandbLogger
 MODEL_CHECKPOINT_TYPE = "model"
 BEST_CHECKPOINT_ALIAS = "best"
 MODEL_CHECKPOINT_PATH = "model.ckpt"
 LOG_DIR = Path("training") / "logs"
 
-STAGED_MODEL_TYPE = "prod-ready"  # we can choose the name of this type, and ideally it's different from checkpoints
-STAGED_MODEL_FILENAME = "model.pt"  # standard nomenclature; pytorch_model.bin is also used
+STAGED_MODEL_TYPE = "prod-ready"
+STAGED_MODEL_FILENAME = "model.pt"
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-
 LITMODEL_CLASS = TransformerLitModel
 
-api = wandb.Api()
+# Resilient API initialization
+try:
+    api = wandb.Api()
+    DEFAULT_ENTITY = api.default_entity
+except Exception:
+    api = None
+    DEFAULT_ENTITY = None
 
-DEFAULT_ENTITY = api.default_entity
 DEFAULT_FROM_PROJECT = "fsdl-text-recognizer-2022-training"
 DEFAULT_TO_PROJECT = "fsdl-text-recognizer-2022-training"
 DEFAULT_STAGED_MODEL_NAME = "paragraph-text-recognizer"
 
 PROD_STAGING_ROOT = PROJECT_ROOT / "text_recognizer" / "artifacts"
+PUBLIC_S3_BUCKET = "fsdl-public-assets"
+PUBLIC_S3_KEY = "models/paragraph-text-recognizer/model.pt"
 
 
 def main(args):
     prod_staging_directory = PROD_STAGING_ROOT / args.staged_model_name
     prod_staging_directory.mkdir(exist_ok=True, parents=True)
-    entity = _get_entity_from(args)
-    # if we're just fetching an already compiled model
-    if args.fetch:
-        # find it and download it
-        staged_model = f"{entity}/{args.from_project}/{args.staged_model_name}:latest"
-        artifact = download_artifact(staged_model, prod_staging_directory)
-        print_info(artifact)
-        return  # and we're done
+    target_model_file = prod_staging_directory / STAGED_MODEL_FILENAME
 
-    # otherwise, we'll need to download the weights, compile the model, and save it
-    with wandb.init(
-        job_type="stage", project=args.to_project, dir=LOG_DIR
-    ):  # log staging to W&B so prod and training are connected
-        # find the model checkpoint and retrieve its artifact name and an api handle
+    # 1. Fetching an existing compiled model
+    if args.fetch:
+        if target_model_file.exists() and not args.force:
+            print(f"Model already present at {target_model_file}. Use --force to re-download.")
+            return
+
+        # Direct URL download bypass (e.g. from W&B Files tab or direct CDN)
+        if args.url:
+            print(f"Downloading model directly from URL:\n{args.url}")
+            download_from_url(args.url, target_model_file)
+            print(f"Successfully saved to {target_model_file}")
+            return
+
+        # Explicit S3 unsigned bucket fetch
+        if args.s3:
+            print(f"Fetching from public S3 bucket: s3://{PUBLIC_S3_BUCKET}/{PUBLIC_S3_KEY}")
+            if download_from_s3(PUBLIC_S3_BUCKET, PUBLIC_S3_KEY, target_model_file):
+                print(f"Successfully saved to {target_model_file}")
+                return
+            print("S3 download failed. Trying W&B API...")
+
+        # W&B Artifact download
+        entity = _get_entity_from(args)
+        version = args.staged_model_version
+        staged_model = f"{entity}/{args.from_project}/{args.staged_model_name}:{version}"
+        print(f"Fetching artifact from W&B: {staged_model}")
+
+        try:
+            artifact = download_artifact(staged_model, prod_staging_directory)
+            print_info(artifact)
+            return
+        except Exception as e:
+            print(f"\n[Warning] W&B API access failed ({e}).")
+            print("Attempting automatic fallback to unsigned public S3 storage...")
+            if download_from_s3(PUBLIC_S3_BUCKET, PUBLIC_S3_KEY, target_model_file):
+                print(f"Recovered successfully! Model saved to {target_model_file}")
+                return
+
+            print("\n[Error] Could not fetch model automatically.")
+            print("Fallback Options:")
+            print(" 1. Copy the download link from the W&B UI 'Files' tab and run:")
+            print('    --fetch --url="<COPIED_URL>"')
+            print(" 2. Use the public S3 flag:")
+            print("    --fetch --s3")
+            raise
+
+    # 2. Compiling and staging from an active training run checkpoint
+    with wandb.init(job_type="stage", project=args.to_project, dir=LOG_DIR):
+        entity = _get_entity_from(args)
         ckpt_at, ckpt_api = find_artifact(
             entity, args.from_project, type=MODEL_CHECKPOINT_TYPE, alias=args.ckpt_alias, run=args.run
         )
 
-        # get the run that produced that checkpoint
         logging_run = get_logging_run(ckpt_api)
         print_info(ckpt_api, logging_run)
         metadata = get_checkpoint_metadata(logging_run, ckpt_api)
 
-        # create an artifact for the staged, deployable model
         staged_at = wandb.Artifact(args.staged_model_name, type=STAGED_MODEL_TYPE, metadata=metadata)
         with tempfile.TemporaryDirectory() as tmp_dir:
-            # download the checkpoint to a temporary directory
             download_artifact(ckpt_at, tmp_dir)
-            # reload the model from that checkpoint
             model = load_model_from_checkpoint(metadata, directory=tmp_dir)
-            # save the model to torchscript in the staging directory
             save_model_to_torchscript(model, directory=prod_staging_directory)
 
-        # upload the staged model so it can be downloaded elsewhere
         upload_staged_model(staged_at, from_directory=prod_staging_directory)
 
 
+def download_from_url(url: str, target_path: Path):
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    urllib.request.urlretrieve(url, str(target_path))
+
+
+def download_from_s3(bucket_name: str, key: str, target_path: Path) -> bool:
+    try:
+        import boto3
+        from botocore import UNSIGNED
+        from botocore.config import Config
+
+        s3 = boto3.client("s3", config=Config(signature_version=UNSIGNED))
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        s3.download_file(bucket_name, key, str(target_path))
+        return True
+    except Exception as e:
+        print(f"S3 fetch failed: {e}")
+        return False
+
+
 def find_artifact(entity: str, project: str, type: str, alias: str, run=None):
-    """Finds the artifact of a given type with a given alias under the entity and project.
-
-    Parameters
-    ----------
-    entity
-        The name of the W&B entity under which the artifact is logged.
-    project
-        The name of the W&B project under which the artifact is logged.
-    type
-        The name of the type of the artifact.
-    alias : str
-        The alias for this artifact. This alias must be unique within the
-        provided type for the run, if provided, or for the project,
-        if the run is not provided.
-    run : str
-        Optionally, the run in which the artifact is located.
-
-    Returns
-    -------
-    Tuple[path, artifact]
-        An identifying path and an API handle for a matching artifact.
-    """
     if run is not None:
         path = _find_artifact_run(entity, project, type=type, run=run, alias=alias)
     else:
@@ -113,8 +149,7 @@ def find_artifact(entity: str, project: str, type: str, alias: str, run=None):
 
 
 def get_logging_run(artifact):
-    api_run = artifact.logged_by()
-    return api_run
+    return artifact.logged_by()
 
 
 def print_info(artifact, run=None):
@@ -127,8 +162,9 @@ def print_info(artifact, run=None):
     artifact_url_suffix = f"{artifact.name.replace(':', '/')}"
     print(f"View at URL: {artifact_url_prefix}/{artifact_url_suffix}")
 
-    print(f"Logged by {run.name} -- {run.project}/{run.entity}/{run.id}")
-    print(f"View at URL: {run.url}")
+    if run:
+        print(f"Logged by {run.name} -- {run.project}/{run.entity}/{run.id}")
+        print(f"View at URL: {run.url}")
 
 
 def get_checkpoint_metadata(run, checkpoint):
@@ -146,13 +182,13 @@ def get_checkpoint_metadata(run, checkpoint):
 
 
 def download_artifact(artifact_path, target_directory):
-    """Downloads the artifact at artifact_path to the target directory."""
-    if wandb.run is not None:  # if we are inside a W&B run, track that we used this artifact
+    if wandb.run is not None:
         artifact = wandb.use_artifact(artifact_path)
-    else:  # otherwise, just download the artifact via the API
+    else:
+        if api is None:
+            raise RuntimeError("W&B API is unauthenticated. Run `wandb login` first.")
         artifact = api.artifact(artifact_path)
-    artifact.download(root=target_directory)
-
+    artifact.download(root=str(target_directory))
     return artifact
 
 
@@ -162,22 +198,20 @@ def load_model_from_checkpoint(ckpt_metadata, directory):
 
     _, model = setup_data_and_model_from_args(args)
 
-    # load LightningModule from checkpoint
     pth = Path(directory) / MODEL_CHECKPOINT_PATH
     lit_model = LITMODEL_CLASS.load_from_checkpoint(checkpoint_path=pth, args=args, model=model, strict=False)
     lit_model.eval()
-
     return lit_model
 
 
 def save_model_to_torchscript(model, directory):
     scripted_model = model.to_torchscript(method="script", file_path=None)
     path = Path(directory) / STAGED_MODEL_FILENAME
-    torch.jit.save(scripted_model, path)
+    torch.jit.save(scripted_model, str(path))
 
 
 def upload_staged_model(staged_at, from_directory):
-    staged_at.add_file(Path(from_directory) / STAGED_MODEL_FILENAME)
+    staged_at.add_file(str(Path(from_directory) / STAGED_MODEL_FILENAME))
     wandb.log_artifact(staged_at)
 
 
@@ -197,16 +231,14 @@ def _find_artifact_project(entity, project, type, alias):
     project_name = f"{entity}/{project}"
     api_project = api.project(project, entity=entity)
     api_artifact_types = api_project.artifacts_types()
-    # loop through all artifact types in this project
     for artifact_type in api_artifact_types:
         if artifact_type.name != type:
-            continue  # skipping those that don't match type
+            continue
         collections = artifact_type.collections()
-        # loop through all artifacts and their versions
         for collection in collections:
             versions = collection.versions()
             for version in versions:
-                if alias in version.aliases:  # looking for the first one that matches the alias
+                if alias in version.aliases:
                     return f"{project_name}/{version.name}"
         raise ValueError(f"Artifact with alias {alias} not found in type {type} in {project_name}")
     raise ValueError(f"Artifact type {type} not found. {project_name} could be private or not exist.")
@@ -214,11 +246,10 @@ def _find_artifact_project(entity, project, type, alias):
 
 def _get_entity_from(args):
     entity = args.entity
-    if entity is None:
-        raise RuntimeError(f"No entity argument provided. Use --entity=DEFAULT to use {DEFAULT_ENTITY}.")
-    elif entity == "DEFAULT":
-        entity = DEFAULT_ENTITY
-
+    if entity is None or entity == "DEFAULT":
+        if DEFAULT_ENTITY:
+            return DEFAULT_ENTITY
+        raise RuntimeError("No entity provided and no default entity found. Set --entity=<entity>.")
     return entity
 
 
@@ -227,43 +258,65 @@ def _setup_parser():
     parser.add_argument(
         "--fetch",
         action="store_true",
-        help=f"If provided, check ENTITY/FROM_PROJECT for an artifact with the provided STAGED_MODEL_NAME and download its latest version to {PROD_STAGING_ROOT}/STAGED_MODEL_NAME.",
+        help=f"Download the staged model to {PROD_STAGING_ROOT}/<STAGED_MODEL_NAME>.",
+    )
+    parser.add_argument(
+        "--staged_model_version",
+        type=str,
+        default="latest",
+        help="Version alias or hash of the artifact to fetch (e.g. 'latest' or '3e07efa34aec61999c5a').",
+    )
+    parser.add_argument(
+        "--url",
+        type=str,
+        default=None,
+        help="Direct URL to download model.pt, bypassing W&B API permissions.",
+    )
+    parser.add_argument(
+        "--s3",
+        action="store_true",
+        help="Download model.pt from the public fsdl-public-assets S3 bucket.",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Force re-download even if model.pt is already present.",
     )
     parser.add_argument(
         "--entity",
         type=str,
         default=None,
-        help=f"Entity from which to download the checkpoint. Note that checkpoints are always uploaded to the logged-in wandb entity. Pass the value 'DEFAULT' to also download from default entity, which is currently {DEFAULT_ENTITY}.",
+        help=f"Entity to download the checkpoint/model from. Default: {DEFAULT_ENTITY}.",
     )
     parser.add_argument(
         "--from_project",
         type=str,
         default=DEFAULT_FROM_PROJECT,
-        help=f"Project from which to download the checkpoint. Default is {DEFAULT_FROM_PROJECT}",
+        help=f"Project from which to download. Default: {DEFAULT_FROM_PROJECT}.",
     )
     parser.add_argument(
         "--to_project",
         type=str,
         default=DEFAULT_TO_PROJECT,
-        help=f"Project to which to upload the compiled model. Default is {DEFAULT_TO_PROJECT}.",
+        help=f"Project to upload the compiled model to. Default: {DEFAULT_TO_PROJECT}.",
     )
     parser.add_argument(
         "--run",
         type=str,
         default=None,
-        help=f"Optionally, the name of a run to check for an artifact of type {MODEL_CHECKPOINT_TYPE} that has the provided CKPT_ALIAS. Default is None.",
+        help=f"Run name containing the {MODEL_CHECKPOINT_TYPE} artifact.",
     )
     parser.add_argument(
         "--ckpt_alias",
         type=str,
         default=BEST_CHECKPOINT_ALIAS,
-        help=f"Alias that identifies which model checkpoint should be staged.The artifact's alias can be set manually or programmatically elsewhere. Default is {BEST_CHECKPOINT_ALIAS!r}.",
+        help=f"Alias identifying the checkpoint to stage. Default: {BEST_CHECKPOINT_ALIAS!r}.",
     )
     parser.add_argument(
         "--staged_model_name",
         type=str,
         default=DEFAULT_STAGED_MODEL_NAME,
-        help=f"Name to give the staged model artifact. Default is {DEFAULT_STAGED_MODEL_NAME!r}.",
+        help=f"Name of the staged model artifact. Default: {DEFAULT_STAGED_MODEL_NAME!r}.",
     )
     return parser
 

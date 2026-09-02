@@ -1,4 +1,5 @@
 """Provide an image of handwritten text and get back out a string!"""
+
 import argparse
 import json
 import logging
@@ -34,7 +35,7 @@ def main(args):
         server_name="0.0.0.0",  # make server accessible, binding all interfaces  # noqa: S104
         server_port=args.port,  # set a port to bind to, failing if unavailable
         share=True,  # should we create a (temporary) public link on https://gradio.app?
-        favicon_path=FAVICON,  # what icon should we display in the address bar?
+        favicon_path=str(FAVICON) if FAVICON.exists() else None,
     )
 
 
@@ -48,23 +49,26 @@ def make_frontend(
 
     examples = [[str(path)] for path in example_paths]
 
-    allow_flagging = "never"
+    # Handle flagging parameter compatibility across Gradio versions
+    flagging_kwargs = {}
+    if "flagging_mode" in gr.Interface.__init__.__code__.co_varnames:
+        flagging_kwargs["flagging_mode"] = "never"
+    else:
+        flagging_kwargs["allow_flagging"] = "never"
 
-    readme = _load_readme(with_logging=allow_flagging == "manual")
+    readme = _load_readme(with_logging=False)
 
-    # build a basic browser interface to a Python function
+    # Build interface without deprecated thumbnail argument
     frontend = gr.Interface(
-        fn=fn,  # which Python function are we interacting with?
-        outputs=gr.components.Textbox(),  # what output widgets does it need? the default text widget
-        # what input widgets does it need? we configure an image widget
-        inputs=gr.components.Image(type="pil", label="Handwritten Text"),
-        title="📝 Text Recognizer",  # what should we display at the top of the page?
-        thumbnail=FAVICON,  # what should we display when the link is shared, e.g. on social media?
-        description=__doc__,  # what should we display just above the interface?
-        article=readme,  # what long-form content should we display below the interface?
-        examples=examples,  # which potential inputs should we provide?
-        cache_examples=False,  # should we cache those inputs for faster inference? slows down start
-        allow_flagging=allow_flagging,  # should we show users the option to "flag" outputs?
+        fn=fn,
+        outputs=gr.Textbox(),
+        inputs=gr.Image(type="pil", label="Handwritten Text"),
+        title="📝 Text Recognizer",
+        description=__doc__,
+        article=readme,
+        examples=examples,
+        cache_examples=False,
+        **flagging_kwargs,
     )
 
     return frontend
@@ -109,16 +113,6 @@ class PredictorBackend:
 
         The endpoint should expect a base64 representation of the image, encoded as a string,
         under the key "image". It should return the predicted text under the key "pred".
-
-        Parameters
-        ----------
-        image
-            A PIL image of handwritten text to be converted into a string.
-
-        Returns
-        -------
-        pred
-            A string containing the predictor's guess of the text in the image.
         """
         encoded_image = util.encode_b64_image(image)
 
@@ -137,10 +131,15 @@ class PredictorBackend:
 
 
 def _load_readme(with_logging=False):
+    if not README.exists():
+        return ""
     with open(README) as f:
         lines = f.readlines()
         if not with_logging:
-            lines = lines[: lines.index("<!-- logging content below -->\n")]
+            split_token = "<!-- logging content below -->"
+            matching = [idx for idx, line in enumerate(lines) if split_token in line]
+            if matching:
+                lines = lines[: matching[0]]
 
         readme = "".join(lines)
     return readme
@@ -152,7 +151,7 @@ def _make_parser():
         "--model_url",
         default=None,
         type=str,
-        help="Identifies a URL to which to send image data. Data is base64-encoded, converted to a utf-8 string, and then set via a POST request as JSON with the key 'image'. Default is None, which instead sends the data to a model running locally.",
+        help="Identifies a URL to which to send image data. Default is None (runs locally).",
     )
     parser.add_argument(
         "--port",

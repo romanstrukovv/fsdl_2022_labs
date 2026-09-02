@@ -1,0 +1,6 @@
+response.json
+training/logs/
+text_recognizer/artifacts/
+lambda.out
+*.pt
+*.ckpt

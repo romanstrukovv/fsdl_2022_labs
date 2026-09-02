@@ -1,3 +1,5 @@
+## Roman Strukov
+
 ## Full-Paragraph Optical Character Recognition
 
 For more on how this application works,
@@ -12,3 +14,5 @@ let us know by clicking the "flagging" buttons underneath.
 We'll analyze the results with
 [Gantry](https://gantry.io/blog/introducing-gantry/)
 and use them to improve the model!
+
+

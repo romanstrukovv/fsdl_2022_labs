@@ -1,0 +1,41 @@
+# Version control and repo metadata
+
+.git/
+.gitignore
+.gitattributes
+README.md
+Makefile
+environment.yml
+
+# Notebooks and documentation
+
+notebooks/
+docs/
+**/.ipynb_checkpoints/
+
+# Python byte code and local caches
+
+**/__pycache__/
+**/*.py[cod]
+**/*.pyo
+**/*.pyd
+.pytest_cache/
+.coverage
+
+# Training datasets and intermediate logs
+
+data/
+training/
+evaluation/
+logs/
+*.log
+
+# Heavy checkpoints (preserve text_recognizer/artifacts/ while ignoring intermediate files)
+
+*.ckpt
+*.h5
+
+# Unit and integration tests
+
+text_recognizer/tests/
+tests/

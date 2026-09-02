@@ -1,0 +1,25 @@
+name: fsdl_2022_labs
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+  - numpy
+  - ipykernel
+  - pre-commit
+  - jq
+  - pip:
+      - --extra-index-url https://download.pytorch.org/whl/cu121
+      - torch==2.4.1+cu121
+      - torchvision==0.19.1+cu121
+      - pytorch-lightning
+      - torchmetrics
+      - boltons
+      - boto3
+      - requests
+      - smart_open
+      - h5py
+      - "starlette<0.36.0"
+      - "fastapi<0.109.0"
+      - "gradio==3.50.2"
